@@ -1,0 +1,234 @@
+from: pytest
+ignore:
+- '**/node_modules/**'
+- '**/dist/**'
+- '**/migrations/**'
+- frontend/**
+- '**/__pycache__/**'
+- '**/*.pyc'
+main_service: python
+max_execution_time: 40
+services:
+  capture:
+    build:
+      args:
+        BIN: capture
+      context: rust/
+    depends_on:
+    - redis
+    - kafka
+    environment:
+    - DEBUG=1
+    - ADDRESS=0.0.0.0:3000
+    - KAFKA_TOPIC=events_plugin_ingestion
+    - KAFKA_HOSTS=kafka:9092
+    - REDIS_URL=redis://redis:6379/
+    - CAPTURE_MODE=events
+    - RUST_LOG=info,rdkafka=warn
+    image: ghcr.io/posthog/posthog/capture:master
+    restart: on-failure
+  clickhouse:
+    depends_on:
+    - kafka
+    - zookeeper
+    extra_hosts:
+    - host.docker.internal:host-gateway
+    hostname: clickhouse
+    image: clickhouse/clickhouse-server:24.8.7.41
+    ports:
+    - 8123:8123
+    - 8443:8443
+    - 9000:9000
+    - 9440:9440
+    - 9009:9009
+    restart: on-failure
+    volumes:
+    - ./docker/clickhouse/entrypoint.sh:/entrypoint.sh
+    - ./posthog/idl:/idl
+    - ./docker/clickhouse/docker-entrypoint-initdb.d:/docker-entrypoint-initdb.d
+    - ./docker/clickhouse/config.xml:/etc/clickhouse-server/config.xml
+    - ./docker/clickhouse/config.d/default.xml:/etc/clickhouse-server/config.d/default.xml
+    - ./docker/clickhouse/users-dev.xml:/etc/clickhouse-server/users.xml
+    - ./docker/clickhouse/user_defined_function.xml:/etc/clickhouse-server/user_defined_function.xml
+    - ./posthog/user_scripts:/var/lib/clickhouse/user_scripts
+  db:
+    command: postgres -c max_connections=1000 -c idle_in_transaction_session_timeout=300000
+    environment:
+      POSTGRES_DB: posthog
+      POSTGRES_PASSWORD: posthog
+      POSTGRES_USER: posthog
+    healthcheck:
+      interval: 5s
+      test:
+      - CMD-SHELL
+      - pg_isready -U posthog
+      timeout: 5s
+    image: postgres:12-alpine
+    ports:
+    - 5432:5432
+    restart: on-failure
+    volumes:
+    - ./docker/postgres-init-scripts:/docker-entrypoint-initdb.d
+  feature-flags:
+    build:
+      args:
+        BIN: feature-flags
+      context: rust/
+    depends_on:
+    - redis
+    - db
+    environment:
+      ADDRESS: 0.0.0.0:3001
+      MAXMIND_DB_PATH: /share/GeoLite2-City.mmdb
+      READ_DATABASE_URL: postgres://posthog:posthog@db:5432/posthog
+      REDIS_URL: redis://redis:6379/
+      SKIP_READS: 'false'
+      SKIP_WRITES: 'false'
+      WRITE_DATABASE_URL: postgres://posthog:posthog@db:5432/posthog
+    image: ghcr.io/posthog/posthog/feature-flags:master
+    restart: on-failure
+    volumes:
+    - ./share:/share
+  kafka:
+    depends_on:
+    - zookeeper
+    environment:
+    - KAFKA_BROKER_ID=1001
+    - KAFKA_CFG_RESERVED_BROKER_MAX_ID=1001
+    - KAFKA_CFG_LISTENERS=PLAINTEXT://:9092
+    - KAFKA_CFG_ADVERTISED_LISTENERS=PLAINTEXT://kafka:9092
+    - KAFKA_CFG_ZOOKEEPER_CONNECT=zookeeper:2181
+    - ALLOW_PLAINTEXT_LISTENER=true
+    healthcheck:
+      interval: 3s
+      retries: 10
+      test: kafka-cluster.sh cluster-id --bootstrap-server localhost:9092 || exit
+        1
+      timeout: 10s
+    image: bitnami/kafka:latest
+    ports:
+    - 9092:9092
+  objectstorage:
+    command: -c 'mkdir -p /data/posthog && minio server --address ":19000" --console-address
+      ":19001" /data'
+    entrypoint: sh
+    environment:
+    - MINIO_ROOT_USER=objectstorage_root_user
+    - MINIO_ROOT_PASSWORD=objectstorage_root_password
+    image: minio/minio:latest
+    ports:
+    - 19000:19000
+    - 19001:19001
+    restart: on-failure
+  python:
+    depends_on:
+    - db
+    - clickhouse
+    - kafka
+    - redis
+    - objectstorage
+    environment:
+    - SECRET_KEY=6b01eee4f945ca25045b5aab440b953461faf08693a9abbf1166dc7c6b9772da
+    - DATABASE_URL=postgres://posthog:posthog@db:5432/posthog
+    - REDIS_URL=redis://redis:6379
+    - CLICKHOUSE_HOST=clickhouse
+    - CLICKHOUSE_SECURE=False
+    - CLICKHOUSE_VERIFY=False
+    - TEST=1
+    - objectstorage_ENABLED=True
+    - objectstorage_ENDPOINT=http://localhost:19000
+    - objectstorage_ACCESS_KEY_ID=objectstorage_root_user
+    - objectstorage_SECRET_ACCESS_KEY=objectstorage_root_password
+    - DISPLAY=:99.0
+    - PERSON_ON_EVENTS_V2_ENABLED=false
+    - AWS_S3_ALLOW_UNSAFE_RENAME=true
+    - CLICKHOUSE_SERVER_IMAGE=clickhouse/clickhouse-server:24.8.7.41
+    - DOCKER_REGISTRY_PREFIX=us-east1-docker.pkg.dev/posthog-301601/mirror/
+    image: python:3.11.9
+  redis:
+    command: redis-server --maxmemory-policy allkeys-lru --maxmemory 200mb
+    healthcheck:
+      interval: 3s
+      retries: 10
+      test:
+      - CMD
+      - redis-cli
+      - ping
+      timeout: 10s
+    image: redis:6.2.7-alpine
+    ports:
+    - 6379:6379
+    restart: on-failure
+  redis7:
+    command: redis-server --maxmemory-policy allkeys-lru --maxmemory 200mb
+    healthcheck:
+      interval: 3s
+      retries: 10
+      test:
+      - CMD
+      - redis-cli
+      - ping
+      timeout: 10s
+    image: redis:7.2-alpine
+    ports:
+    - 6479:6379
+    restart: on-failure
+  replay-capture:
+    build:
+      args:
+        BIN: capture
+      context: rust/
+    depends_on:
+    - redis
+    - kafka
+    environment:
+      ADDRESS: 0.0.0.0:3000
+      CAPTURE_MODE: recordings
+      KAFKA_HOSTS: kafka:9092
+      KAFKA_TOPIC: session_recording_snapshot_item_events
+      REDIS_URL: redis://redis:6379/
+    image: ghcr.io/posthog/posthog/capture:master
+    restart: on-failure
+  zookeeper:
+    image: zookeeper:3.7.0
+    ports:
+    - 2181:2181
+    restart: on-failure
+setup_commands:
+- apt-get update && apt-get install -y libxml2-dev libxmlsec1 libxmlsec1-dev libxmlsec1-openssl
+  libboost-all-dev unzip cmake curl uuid pkg-config brotli libv8-dev
+- echo "127.0.0.1 kafka" >> /etc/hosts
+- echo "127.0.0.1 objectstorage" >> /etc/hosts
+- echo "127.0.0.1 clickhouse" >> /etc/hosts
+- pip install uv
+- pip install poetry
+- pip install stpyv8==13.1.201.22 --no-build-isolation
+- uv pip install --system -r requirements.txt -r requirements-dev.txt --no-build-isolation
+- uv pip install --system pytest-json-report pytest-cov pytest-reportlog pytest-split
+  coverage
+- curl -fsSL https://get.pnpm.io/install.sh | sh -
+- export PNPM_HOME="/root/.local/share/pnpm"
+- export PATH="$PNPM_HOME:$PATH"
+- curl -fsSL https://deb.nodesource.com/setup_18.x | bash -
+- apt-get install -y nodejs
+- npm install -g pnpm@8
+- pnpm --filter=@posthog/plugin-transpiler... install --frozen-lockfile
+- bin/turbo --filter=@posthog/plugin-transpiler build
+- mkdir -p frontend/dist
+- touch frontend/dist/index.html frontend/dist/layout.html frontend/dist/exporter.html
+- mkdir -p share
+- curl -L "https://mmdbcdn.posthog.net/" --http1.1 | brotli --decompress --output=./share/GeoLite2-City.mmdb
+- cp posthog/user_scripts/latest_user_defined_function.xml docker/clickhouse/user_defined_function.xml
+  || true
+- python -c "import time; time.sleep(15)"
+single_file_test_commands:
+- python -m pytest "$TEST_FILE" --durations=100 --durations-min=1.0 --json-report
+  --cov=.
+- python -m coverage json -i || true
+skip_coverage: true
+test_commands:
+- python -m pytest posthog -m "not async_migrations" --ignore=posthog/temporal --ignore=common/hogvm/python/test
+  --splits 4 --group 1 --durations=100 --durations-min=1.0 --store-durations --json-report
+- echo 'completed test_commands'
+- python -m coverage combine || true
+- python -m coverage json -i || true
